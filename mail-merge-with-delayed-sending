@@ -1,0 +1,282 @@
+//
+// Copyright Mark W J Redding , 2021
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not
+// use this file except in compliance with the License.  You may obtain a copy
+// of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+// License for the specific language governing permissions and limitations under
+// the License.
+//
+// Adapted from the work of Martin Hawksey (see below)
+//
+// 1. Allow emails to be "scheduled" for later sending
+// 2. Allow multiple recipients on a line
+//
+//
+// Copyright Martin Hawksey 2020
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not
+// use this file except in compliance with the License.  You may obtain a copy
+// of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+// License for the specific language governing permissions and limitations under
+// the License.
+
+
+/**
+ * @OnlyCurrentDoc
+*/
+ 
+/**
+ * Change these to match the column names you are using for email 
+ * recipient addresses and email sent column.
+*/
+const RECIPIENT_COL  = "Recipient";
+const EMAIL_SENT_COL = "Email Sent";
+ 
+ /** 
+ * Creates the menu item "Mail Merge" for user to run scripts on drop-down.
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Mail Merge')
+      .addItem('Send Emails', 'sendEmails')
+      .addToUi();
+}
+
+// MWJR: Moved outside of the sendEmails function to make it accessible to the trigger code
+var out = [];
+
+/**
+ * Send emails from sheet data.
+ * @param {string} subjectLine (optional) for the email draft message
+ * @param {integer} timeDelay (optional) in minutes before sending the emails
+ * @param {Sheet} sheet to read data from
+*/
+function sendEmails(subjectLine, timeDelay, sheet=SpreadsheetApp.getActiveSheet()) {
+  // option to skip browser prompt if you want to use this code in other projects
+  if (!subjectLine){
+    subjectLine = Browser.inputBox("Mail Merge", 
+                                      "Type or copy/paste the subject line of the Gmail " +
+                                      "draft message you would like to mail merge with:",
+                                      Browser.Buttons.OK_CANCEL);
+                                      
+    if (subjectLine === "cancel" || subjectLine == ""){ 
+     return;
+    }
+
+    if (!timeDelay){
+      timeDelay = Browser.inputBox("Mail Merge", 
+                                      "Delay messages for how many minutes (0=no delay) ?",
+                                      Browser.Buttons.OK_CANCEL);
+    }
+
+  }
+  
+  const emailTemplate = getGmailTemplateFromDrafts_(subjectLine);
+  const dataRange = sheet.getDataRange();
+  const data = dataRange.getDisplayValues();
+  const heads = data.shift(); 
+  
+  const emailSentColIdx = heads.indexOf(EMAIL_SENT_COL);
+  
+  const obj = data.map(r => (heads.reduce((o, k, i) => (o[k] = r[i] || '', o), {})));
+
+      //MWJR+
+      // Because we always use a time based trigger to send the email, make the delay really small if the user didn't want to schedule the sending
+      var delay = 1000 * timeDelay * 60;
+      if(timeDelay == 0) {
+        delay = 10;
+      }
+          var trigger = ScriptApp.newTrigger("scheduleEmail_")
+                      .timeBased()
+                      .after(delay)
+                      .create();
+          setupTriggerArguments(trigger, [obj, emailTemplate, out, emailSentColIdx], false);
+      //MWJR-  
+}
+
+ /**
+   * Get a Gmail draft message by matching the subject line.
+   * @param {string} subject_line to search for draft message
+   * @return {object} containing the subject, plain and html message body and attachments
+  */
+  function getGmailTemplateFromDrafts_(subject_line){
+    try {
+      const drafts = GmailApp.getDrafts();
+      const draft = drafts.filter(subjectFilter_(subject_line))[0];
+      const msg = draft.getMessage();
+
+      const allInlineImages = draft.getMessage().getAttachments({includeInlineImages: true,includeAttachments:false});
+      const attachments = draft.getMessage().getAttachments({includeInlineImages: false});
+      const htmlBody = msg.getBody(); 
+
+      const img_obj = allInlineImages.reduce((obj, i) => (obj[i.getName()] = i, obj) ,{});
+
+      const imgexp = RegExp('<img.*?src="cid:(.*?)".*?alt="(.*?)"[^\>]+>', 'g');
+      const matches = [...htmlBody.matchAll(imgexp)];
+
+      const inlineImagesObj = {};
+      matches.forEach(match => inlineImagesObj[match[1]] = img_obj[match[2]]);
+
+      return {message: {subject: subject_line, text: msg.getPlainBody(), html:htmlBody}, 
+              attachments: attachments, inlineImages: inlineImagesObj };
+    } catch(e) {
+      throw new Error("Oops - can't find Gmail draft");
+    }
+
+    /**
+     * Filter draft objects with the matching subject linemessage by matching the subject line.
+     * @param {string} subject_line to search for draft message
+     * @return {object} GmailDraft object
+    */
+    function subjectFilter_(subject_line){
+      return function(element) {
+        if (element.getMessage().getSubject() === subject_line) {
+          return element;
+        }
+      }
+    }
+  }
+  
+    /**
+   * Fill template string with data object
+   * @see https://stackoverflow.com/a/378000/1027723
+   * @param {string} template string containing {{}} markers which are replaced with data
+   * @param {object} data object used to replace {{}} markers
+   * @return {object} message replaced with data
+  */
+  function fillInTemplateFromObject_(template, data) {
+    let template_string = JSON.stringify(template);
+
+    template_string = template_string.replace(/{{[^{}]+}}/g, key => {
+      return escapeData_(data[key.replace(/[{}]+/g, "")] || "");
+    });
+    return  JSON.parse(template_string);
+  }
+
+  /**
+   * Escape cell data to make JSON safe
+   * @see https://stackoverflow.com/a/9204218/1027723
+   * @param {string} str to escape JSON special characters from
+   * @return {string} escaped string
+  */
+  function escapeData_(str) {
+    return str
+      .replace(/[\\]/g, '\\\\')
+      .replace(/[\"]/g, '\\\"')
+      .replace(/[\/]/g, '\\/')
+      .replace(/[\b]/g, '\\b')
+      .replace(/[\f]/g, '\\f')
+      .replace(/[\n]/g, '\\n')
+      .replace(/[\r]/g, '\\r')
+      .replace(/[\t]/g, '\\t');
+  }
+
+ /**
+   * Called by a triggger; once fired send the emails to recipients.
+   * @param {string} event; the triggered event data
+  */
+//<MWJR+
+// processing of the email taken out of sendEmails function so that it could be called by a trigger
+  function scheduleEmail_(event) {
+
+      var farg = handleTriggered(event.triggerUid);
+      obj = farg[0];
+      emailTemplate = farg[1];
+      out = farg[2];
+      emailSentColIdx = farg[3];
+
+  obj.forEach(function(row, rowIdx){
+    if (row[EMAIL_SENT_COL] == ''){
+      try {
+        const msgObj = fillInTemplateFromObject_(emailTemplate.message, row);
+
+        let addrs = row[RECIPIENT_COL].split(';');  // if the Recipient column contains a ';' separated listof email addresses then send a message to each address
+
+        for(let l = 0; l < addrs.length; l++) {
+        GmailApp.sendEmail(addrs[l], msgObj.subject, msgObj.text, {
+          htmlBody: msgObj.html,
+          attachments: emailTemplate.attachments,
+          inlineImages: emailTemplate.inlineImages
+        });
+
+      }
+        out.push([new Date()]);
+      } catch(e) {
+        // modify cell to record error
+        out.push([e.message]);
+      }
+    } else {
+      out.push([row[EMAIL_SENT_COL]]);
+    }
+  });
+
+  SpreadsheetApp.getActiveSheet().getRange(2, emailSentColIdx+1, out.length).setValues(out);
+
+  }
+  //MWJR-
+
+
+// MWJR+
+// Time based triggers taken from the below stackoverflow question
+// https://stackoverflow.com/questions/32697653/how-can-i-pass-a-parameter-to-a-time-based-google-app-script-trigger
+// MWJR-
+
+var RECURRING_KEY = "recurring";
+var ARGUMENTS_KEY = "arguments";
+
+function setupTriggerArguments(trigger, functionArguments, recurring) {
+  var triggerUid = trigger.getUniqueId();
+  var triggerData = {};
+  triggerData[RECURRING_KEY] = recurring;
+  triggerData[ARGUMENTS_KEY] = functionArguments;
+
+  PropertiesService.getScriptProperties().setProperty(triggerUid, JSON.stringify(triggerData));
+}
+
+function handleTriggered(triggerUid) {
+  var scriptProperties = PropertiesService.getScriptProperties();
+  var triggerData = JSON.parse(scriptProperties.getProperty(triggerUid));
+
+  if (!triggerData[RECURRING_KEY]) {
+    deleteTriggerByUid(triggerUid);
+  }
+
+  return triggerData[ARGUMENTS_KEY];
+}
+
+function deleteTriggerArguments(triggerUid) {
+  PropertiesService.getScriptProperties().deleteProperty(triggerUid);
+}
+
+function deleteTriggerByUid(triggerUid) {
+  if (!ScriptApp.getProjectTriggers().some(function (trigger) {
+    if (trigger.getUniqueId() === triggerUid) {
+      ScriptApp.deleteTrigger(trigger);
+      return true;
+    }
+
+    return false;
+  })) {
+    console.error("Could not find trigger with id '%s'", triggerUid);
+  }
+
+  deleteTriggerArguments(triggerUid);
+}
+
+function deleteTrigger(trigger) {
+  ScriptApp.deleteTrigger(trigger);
+  deleteTriggerArguments(trigger.getUniqueId());
+}
